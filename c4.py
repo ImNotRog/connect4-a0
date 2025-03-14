@@ -2,6 +2,8 @@ import numpy as np
 import random
 import math
 import time
+import cProfile
+
 
 import os
 import torch
@@ -246,14 +248,13 @@ class MCTS:
 					max_child = child
 					max_i = i
 			
-
 			current = max_child
 	
 	def move(self, child_index):
-		if not self.root.children:
-			raise Exception("Attempted to move without evaluating children first!")
-		if not self.root.children[child_index]:
-			raise Exception("Attempted to move to blank child!")
+		# if not self.root.children:
+		# 	raise Exception("Attempted to move without evaluating children first!")
+		# if not self.root.children[child_index]:
+		# 	raise Exception("Attempted to move to blank child!")
 
 		self.root = self.root.children[child_index]
 		self.root.disable_backprop = True
@@ -262,8 +263,8 @@ class MCTS:
 		self.move( self.root.rand_move( 1 if self.root.game.num_moves < 7 else 0.001 ) )
 
 	def generate_data_set(self):
-		if not self.root.is_terminal:
-			raise "Generating data set from non-terminal state!"
+		# if not self.root.is_terminal:
+		# 	raise "Generating data set from non-terminal state!"
 
 		result = self.root.game.reward
 		
@@ -353,12 +354,21 @@ class Connect4NN(nn.Module):
 
 model = Connect4NN()
 
-for i in range(20):
+def my_func():
+	print("START!")
 	a = time.time()
-	m = MCTS(None,model,50)
+	m = MCTS(None,model,100)
 	m.run()
 	b = time.time()
 
-	print(b-a)
+	print("FINISHED! ", b-a)
 
+# for i in range(20):
+# 	a = time.time()
+# 	m = MCTS(None,model,50)
+# 	m.run()
+# 	b = time.time()
 
+# 	print(b-a)
+
+cProfile.run("my_func()",None,"tottime")
