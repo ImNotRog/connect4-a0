@@ -22,62 +22,67 @@ class Connect4:
 	BOARD_HEIGHT = 6
 	IN_A_ROW = 4
 
-	def __init__(self, board:np.array, player: int):
-		if board.shape != (Connect4.BOARD_HEIGHT, Connect4.BOARD_WIDTH):
-			raise Exception("Invalid board dimensions!")
-		self.board = np.copy(board) # 6 x 7 numpy matrix
+	def __init__(self, board:np.array, player: int, num_moves, i, j):
+		# if board.shape != (Connect4.BOARD_HEIGHT, Connect4.BOARD_WIDTH):
+		# 	raise Exception("Invalid board dimensions!")
+		self.board = board # 6 x 7 numpy matrix
 		self.player = player # -1 or 1
-		self.opp_board = - self.board
+		self.opp_board = -self.board
 		self.children = False
 		
-		self.num_moves = int(sum(sum(abs( self.board ))))
-		self.check_terminality()
-
-	def check_terminality(self):
-		self.is_terminal = True
+		self.num_moves = num_moves
+		# self.check_terminality(i,j)
+		self.i = i
+		self.j = j
+		self.is_terminal_cache = -1
 		self.reward = 0
 
-		for a in self.board:
-			for b in a:
-				if not b:
-					self.is_terminal = False
+	def is_terminal(self):
+		if self.is_terminal_cache != -1:
+			return self.is_terminal_cache
 
-		# horizontals
-		for i in range(Connect4.BOARD_HEIGHT):
-			for j in range(Connect4.BOARD_WIDTH - Connect4.IN_A_ROW+1):
-				self.check_4_in_row(i,j,0,1)
+		if self.num_moves == 0:
+			self.is_terminal_cache = False
+			self.reward = 0
+			return False
+
+		self.is_terminal_cache = self.num_moves == Connect4.BOARD_HEIGHT * Connect4.BOARD_WIDTH
+		self.reward = 0
 		
-		# verticals
-		for i in range(Connect4.BOARD_HEIGHT - Connect4.IN_A_ROW + 1):
-			for j in range(Connect4.BOARD_WIDTH):
-				self.check_4_in_row(i,j,1,0)
-				
-		# diags
-		for i in range(Connect4.BOARD_HEIGHT - Connect4.IN_A_ROW + 1):
-			for j in range(Connect4.BOARD_WIDTH - Connect4.IN_A_ROW + 1):
-				self.check_4_in_row(i,j,1,1)
+		for (idir, jdir) in [(1,0), (0,1), (1,1), (1,-1)]:
+			self.check_4_in_row(self.i,self.j, idir,jdir)
 		
-		for i in range(Connect4.IN_A_ROW - 1, Connect4.BOARD_HEIGHT):
-			for j in range(Connect4.BOARD_WIDTH - Connect4.IN_A_ROW + 1):
-				self.check_4_in_row(i,j,-1,1)
-			  
+		return self.is_terminal_cache
+	
+	def get_reward(self):
+		if self.is_terminal_cache == -1:
+			self.is_terminal()
+		return self.reward
+
 	def check_4_in_row(self, i,j, i_dir, j_dir):
 		color = self.board[i][j]
-		if not color:
-			return 0
 
-		in_a_row = True
-		for k in range(1, Connect4.IN_A_ROW):
-			if self.board[i + k * i_dir][j + k * j_dir] != color:
-				in_a_row = False
+		TOT = 1
+		i1, j1 = i + i_dir, j + j_dir
+		while i1 < Connect4.BOARD_HEIGHT and j1 < Connect4.BOARD_WIDTH and i1 >= 0 and j1 >= 0 and self.board[i1][j1] == color:
+			TOT += 1
+			i1, j1 = i1 + i_dir, j1 + j_dir
+
+		i1, j1 = i - i_dir, j - j_dir
+		while i1 < Connect4.BOARD_HEIGHT and j1 < Connect4.BOARD_WIDTH and i1 >= 0 and j1 >= 0 and self.board[i1][j1] == color:
+			TOT += 1
+			i1, j1 = i1 - i_dir, j1 - j_dir
 		
-		if in_a_row:
-			self.is_terminal = True
+		if TOT >= 4:
+			self.is_terminal_cache = True
 			self.reward = color
 			return color
-		
+
 		return 0
 	
+	def get_opp_board(self):
+		return self.opp_board
+
 	def __str__(self):
 		output_str = "Connect4 Board!\n---------------\n"
 		for i in reversed(range(Connect4.BOARD_HEIGHT)):
@@ -106,7 +111,7 @@ class Connect4:
 				new_board = np.copy(self.board)
 				new_board[j][i] = self.player
 
-				child = Connect4(new_board,-self.player)
+				child = Connect4(new_board,-self.player,self.num_moves+1,j,i)
 				self.children.append(child)
 		
 		return self.children
@@ -115,24 +120,22 @@ class MCTSNode:
 
 	EXPLORATION_CONSTANT = 3
 	
-	DEFAULT_BOARD = Connect4( np.zeros((6,7)), 1 )
+	DEFAULT_BOARD = Connect4( np.zeros((6,7)), 1, 0, 1, 1 )
 
 	def __init__(self, parent, game: Connect4):
 		self.game = game
-		self.is_terminal = game.is_terminal
 		self.children = False
 
 		self.parent = parent
-		# if not parent:
-		# 	self.parent = None
-		# else:
-		# 	self.parent = parent
 		
 		self.Vsum = 0
 		self.N = 0
 		self.P = [] # prior move probabilities
 
 		self.disable_backprop = False
+
+	def is_terminal(self):
+		return self.game.is_terminal()
 
 	def UCB(self, child_index):
 		# if self.is_leaf() or self.children[child_index] == None:
@@ -149,8 +152,8 @@ class MCTSNode:
 
 	def evaluate_and_rollout(self, neuralnet):
 
-		if(self.is_terminal):
-			self.backprop(self.game.reward)
+		if(self.is_terminal()):
+			self.backprop(self.game.get_reward())
 			return
 
 		# expand children + evaluate using NN
@@ -165,7 +168,7 @@ class MCTSNode:
 		if self.game.player == 1:
 			result = neuralnet( torch.from_numpy(self.game.board).float().unsqueeze_(0).unsqueeze_(0) ) # TODO: batch
 		else:
-			result = neuralnet( torch.from_numpy(self.game.opp_board).float().unsqueeze_(0).unsqueeze_(0) )
+			result = neuralnet( torch.from_numpy(self.game.get_opp_board()).float().unsqueeze_(0).unsqueeze_(0) )
 
 		# result = [1,1,1,1,1,1,1,0]
 
@@ -236,7 +239,7 @@ class MCTS:
 		current = self.root
 
 		while(True):
-			if current.is_terminal or current.is_leaf():
+			if current.is_terminal() or current.is_leaf():
 				current.evaluate_and_rollout(self.nn)
 				return
 			
@@ -266,17 +269,20 @@ class MCTS:
 		# if not self.root.is_terminal:
 		# 	raise "Generating data set from non-terminal state!"
 
-		result = self.root.game.reward
+		result = self.root.game.get_reward()
 		
 		boards = []
 
 		current = self.root
 		while True:
+			# print(current.game)
 			boards.append(torch.from_numpy( current.game.board.astype(float) ) )
 			if current.parent:
 				current = current.parent
 			else:
 				break
+				
+			
 		
 		X = torch.stack(boards)
 		Y = torch.ones((X.shape[0])) * result
@@ -284,7 +290,7 @@ class MCTS:
 		return (X,Y)
 	
 	def run(self):
-		while not self.root.is_terminal:
+		while not self.root.is_terminal():
 			for i in range(self.EVALUATIONS_PER): # 100 rollouts per move
 				self.iterate()
 		
@@ -354,15 +360,21 @@ class Connect4NN(nn.Module):
 
 model = Connect4NN()
 
+
+
 def my_func():
 	print("START!")
 	a = time.time()
-	m = MCTS(None,model,100)
-	m.run()
+
+	for i in range(10):
+		m = MCTS(None,model,100)
+		m.run()
 	b = time.time()
 
-	print("FINISHED! ", b-a)
+	print("FINISHED! ", (b-a)/10)
 
+
+my_func()
 # for i in range(20):
 # 	a = time.time()
 # 	m = MCTS(None,model,50)
@@ -371,4 +383,4 @@ def my_func():
 
 # 	print(b-a)
 
-cProfile.run("my_func()",None,"tottime")
+# cProfile.run("my_func()",None,"tottime")
