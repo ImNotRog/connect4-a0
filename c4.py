@@ -3,8 +3,9 @@ import random
 import math
 import time
 import cProfile
+import torch.multiprocessing as mp
+import psutil
 
-# CACHE AND BATCH
 
 import os
 import torch
@@ -141,7 +142,7 @@ class MCTSNode:
 		# UCB = Q + c * P/(1+N)
 		q = 0
 		if self.children[child_index].N:
-			q = self.children[child_index].Vsum/self.children[child_index].N * self.game.player
+			q = (self.children[child_index].Vsum/self.children[child_index].N * self.game.player + 1) / 2 # map q -> [0,1]
 		u = MCTSNode.EXPLORATION_CONSTANT * self.P[child_index] * math.sqrt(self.N) / (1 + self.children[child_index].N)
 		ucb = q + u
 
@@ -170,16 +171,10 @@ class MCTSNode:
 			else:
 				self.children.append(None)
 
-		# with torch.no_grad():
-		# 	if self.game.player == 1:
-		# 		result = neuralnet( torch.from_numpy(self.game.board).float().unsqueeze_(0).unsqueeze_(0) ) # TODO: batch
-		# 	else:
-		# 		result = neuralnet( torch.from_numpy(self.game.get_opp_board()).float().unsqueeze_(0).unsqueeze_(0) )
-
-		# result = [1,1,1,1,1,1,1,0]
-
 		self.Vsum = (float(output_tensor[7]) * 2 - 1) * self.game.player # from NN (map sigmoid into (-1,1))
-		self.P = [ float(i) for i in output_tensor[0:7]] # from NN TODO: Dirichlet noise
+
+		noise = np.random.dirichlet([.03] * 7)
+		self.P = [ .75 * float(output_tensor[i]) + .25 * float(noise[i]) for i in range(7)]
 		self.N = 1
 
 		if self.parent and not self.disable_backprop:
@@ -194,7 +189,7 @@ class MCTSNode:
 	def is_leaf(self):
 		return not self.children
 
-	def best_move(self): # MUST BE PROBABILISTIC
+	def best_move(self):
 		max_child = None
 		max_i = -1
 		for i in range(len(self.children)):
@@ -211,7 +206,7 @@ class MCTSNode:
 		for child in self.children:
 			if child:
 				s += math.pow(child.N / max_child.N, 1/temperature)
-		
+
 		x = s * random.random()
 		for i in range(len(self.children)):
 			if self.children[i]:
@@ -249,8 +244,13 @@ class MCTS:
 		self.root = self.root.children[child_index]
 		self.root.disable_backprop = True
 
-	def move_to_rand_move(self):
-		self.move( self.root.rand_move( 1 if self.root.game.num_moves < 7 else 0.001 ) )
+	def move_to_rand_move(self, temperature=None):
+		if temperature == None:
+			temperature = 1 if self.root.game.num_moves < 7 else 0
+		
+		if temperature == 0:
+			self.move( self.root.best_move() )
+		self.move( self.root.rand_move( temperature ) )
 
 	def generate_data_set(self):
 		# if not self.root.is_terminal:
@@ -273,18 +273,9 @@ class MCTS:
 		Y = torch.ones((X.shape[0])) * result
 
 		return (X,Y)
-	
-	# def run(self):
-	# 	while not self.root.is_terminal():
-	# 		for i in range(self.EVALUATIONS_PER): # 100 rollouts per move
-	# 			self.iterate_without_final_rollout()
-		
-	# 		self.move_to_rand_move()
-		
-	# 	return self.generate_data_set()
 
 class MCTSManager:
-	def __init__(self, num, nn: Connect4, evaluations_per = 100):
+	def __init__(self, num, nn, evaluations_per = 100):
 		self.mcts = []
 		self.finished = []
 		self.nn = nn
@@ -310,10 +301,9 @@ class MCTSManager:
 		
 		if len(input_tensors) > 0:
 			input_torch = torch.stack(input_tensors).float().to(device)
-			# print(input_torch.dtype)
-			# print(input_torch.device, next(self.nn.parameters()).device)
 			with torch.no_grad():
 				pred = self.nn(input_torch).cpu().numpy()
+			
 
 		index = 0
 		for i in range(len(self.mcts)):
@@ -342,6 +332,43 @@ class MCTSManager:
 			
 			if len(self.mcts) == 0:
 				return
+
+class MCTSEvaluator(MCTSManager):
+
+	def __init__(self, num, nn1, nn2, evaluations_per = 100):
+		super().__init__(num, None, evaluations_per)
+		self.nn1 = nn1
+		self.nn2 = nn2
+		self.player = 1
+		self.outcomes = 0
+	
+	def run(self):
+		while True:
+			
+			if self.player == 1:
+				self.nn = self.nn1
+			else:
+				self.nn = self.nn2
+
+			for _ in range(self.EVALUATIONS_PER):
+				self.iterate()
+
+			for m in self.mcts:
+				m.move_to_rand_move(0)
+			
+			new_mcts = []
+			for m in self.mcts:
+				if m.root.is_terminal():
+					self.finished.append(m)
+					self.outcomes += m.root.game.get_reward()
+					# print(m.root.game)
+				else:
+					new_mcts.append(m)
+			
+			self.mcts = new_mcts
+			
+			if len(self.mcts) == 0:
+				return self.outcomes
 
 class Connect4NN(nn.Module):
 	INTERNAL_CHANNELS = 64
@@ -408,37 +435,45 @@ class Connect4NN(nn.Module):
 		# print(p.shape, v.shape)
 		return torch.cat((p,v),dim=1)
 
-model = Connect4NN().to(device)
-# model.eval()
+# model1 = Connect4NN()
+# model2 = Connect4NN()
 
-for name, param in model.named_parameters():
-	print(f"Layer: {name}, Weight type: {param.dtype}")
-	break
+# model1.eval()
+# model2.eval()
 
+# def my_func(m1, m2):
 
-def my_func():
-	print("START!")
+# 	m1 = m1.to(device)
+# 	m2 = m2.to(device)
 
-	a = time.time()
+# 	print("START!")
 
-	m = MCTSManager(20,model,100)
-	m.run()
-
-	# for i in range(100):
-	# 	m = MCTS(None,100)
-	# 	m.run()
-	b = time.time()
-
-	print("FINISHED! ", (b-a))
-
-
-# my_func()
-# for i in range(20):
 # 	a = time.time()
-# 	m = MCTS(None,model,50)
-# 	m.run()
+
+# 	m = MCTSEvaluator(20, m1, m2, 100)
+# 	outcomes = m.run()
+
 # 	b = time.time()
 
-# 	print(b-a)
+# 	print("FINISHED! ", (b-a), outcomes)
 
-cProfile.run("my_func()",None,"tottime")
+if __name__ == '__main__':
+
+	mp.set_start_method('spawn')
+
+	processes = []
+
+	for i in range(5):
+		pass
+		# processes.append(mp.Process(target=my_func, args=(model1,model2)))
+
+	for process in processes:
+		process.start()
+
+	for process in processes:
+		process.join()
+
+	# with torch.no_grad():
+	# 	print(model1( torch.zeros((1,1,6,7)).to(device) ))
+	# 	print(model1( torch.zeros((1,1,6,7)).to(device) ))
+	# 	print(model1( torch.zeros((1,1,6,7)).to(device) ))
