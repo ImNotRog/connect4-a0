@@ -4,6 +4,7 @@ import math
 import time
 import cProfile
 
+# CACHE AND BATCH
 
 import os
 import torch
@@ -27,7 +28,6 @@ class Connect4:
 		# 	raise Exception("Invalid board dimensions!")
 		self.board = board # 6 x 7 numpy matrix
 		self.player = player # -1 or 1
-		self.opp_board = -self.board
 		self.children = False
 		
 		self.num_moves = num_moves
@@ -79,9 +79,6 @@ class Connect4:
 			return color
 
 		return 0
-	
-	def get_opp_board(self):
-		return self.opp_board
 
 	def __str__(self):
 		output_str = "Connect4 Board!\n---------------\n"
@@ -150,7 +147,15 @@ class MCTSNode:
 
 		return ucb
 
-	def evaluate_and_rollout(self, neuralnet):
+	def get_nn_input(self):
+		if self.is_terminal():
+			return None
+		
+		if self.game.player == -1:
+			return torch.from_numpy(-self.game.board).unsqueeze_(0)
+		return torch.from_numpy(self.game.board).unsqueeze_(0)
+
+	def evaluate_and_rollout(self, output_tensor=None):
 
 		if(self.is_terminal()):
 			self.backprop(self.game.get_reward())
@@ -165,15 +170,16 @@ class MCTSNode:
 			else:
 				self.children.append(None)
 
-		if self.game.player == 1:
-			result = neuralnet( torch.from_numpy(self.game.board).float().unsqueeze_(0).unsqueeze_(0) ) # TODO: batch
-		else:
-			result = neuralnet( torch.from_numpy(self.game.get_opp_board()).float().unsqueeze_(0).unsqueeze_(0) )
+		# with torch.no_grad():
+		# 	if self.game.player == 1:
+		# 		result = neuralnet( torch.from_numpy(self.game.board).float().unsqueeze_(0).unsqueeze_(0) ) # TODO: batch
+		# 	else:
+		# 		result = neuralnet( torch.from_numpy(self.game.get_opp_board()).float().unsqueeze_(0).unsqueeze_(0) )
 
 		# result = [1,1,1,1,1,1,1,0]
 
-		self.Vsum = (float(result[7]) * 2 - 1) * self.game.player # from NN (map sigmoid into (-1,1))
-		self.P = [ float(i) for i in result[0:7]] # from NN TODO: Dirichlet noise
+		self.Vsum = (float(output_tensor[7]) * 2 - 1) * self.game.player # from NN (map sigmoid into (-1,1))
+		self.P = [ float(i) for i in output_tensor[0:7]] # from NN TODO: Dirichlet noise
 		self.N = 1
 
 		if self.parent and not self.disable_backprop:
@@ -189,11 +195,6 @@ class MCTSNode:
 		return not self.children
 
 	def best_move(self): # MUST BE PROBABILISTIC
-		# if self.is_terminal:
-		# 	raise Exception("Attempted to find best move at terminal state!")
-		# if not self.children:
-		# 	raise Exception("Attempted to find best move without evaluating children first!")
-		
 		max_child = None
 		max_i = -1
 		for i in range(len(self.children)):
@@ -204,11 +205,6 @@ class MCTSNode:
 		return max_i
 	
 	def rand_move(self, temperature):
-		# if self.is_terminal:
-		# 	raise Exception("Attempted to find rand move at terminal state!")
-		# if not self.children:
-		# 	raise Exception("Attempted to find rand move without evaluating children first!")
-
 		max_child = self.children[self.best_move()] # must normalize by maxchild.N^temperature, as this might be an extremely large number
 
 		s = 0
@@ -227,21 +223,17 @@ class MCTSNode:
 
 class MCTS:
 
-	def __init__(self, root: Connect4, nn, evaluations_per = 100):
+	def __init__(self, root: Connect4):
 		if not root:
 			root = MCTSNode.DEFAULT_BOARD
 		self.root = MCTSNode( None, root )
-		self.nn = nn
 
-		self.EVALUATIONS_PER = evaluations_per
-
-	def iterate(self):
+	def iterate_without_final_rollout(self):
 		current = self.root
 
 		while(True):
 			if current.is_terminal() or current.is_leaf():
-				current.evaluate_and_rollout(self.nn)
-				return
+				return current
 			
 			max_child = None
 			max_i = None
@@ -254,11 +246,6 @@ class MCTS:
 			current = max_child
 	
 	def move(self, child_index):
-		# if not self.root.children:
-		# 	raise Exception("Attempted to move without evaluating children first!")
-		# if not self.root.children[child_index]:
-		# 	raise Exception("Attempted to move to blank child!")
-
 		self.root = self.root.children[child_index]
 		self.root.disable_backprop = True
 
@@ -281,47 +268,108 @@ class MCTS:
 				current = current.parent
 			else:
 				break
-				
-			
-		
+
 		X = torch.stack(boards)
 		Y = torch.ones((X.shape[0])) * result
 
 		return (X,Y)
 	
+	# def run(self):
+	# 	while not self.root.is_terminal():
+	# 		for i in range(self.EVALUATIONS_PER): # 100 rollouts per move
+	# 			self.iterate_without_final_rollout()
+		
+	# 		self.move_to_rand_move()
+		
+	# 	return self.generate_data_set()
+
+class MCTSManager:
+	def __init__(self, num, nn: Connect4, evaluations_per = 100):
+		self.mcts = []
+		self.finished = []
+		self.nn = nn
+		for _ in range(num):
+			self.mcts.append(MCTS(None))
+		self.EVALUATIONS_PER = evaluations_per
+		self.node_ptrs = [None] * num
+
+	def iterate(self):
+
+		input_tensors = []
+		for i in range(len(self.mcts)):
+			m = self.mcts[i]
+			node = m.iterate_without_final_rollout()
+			input_tensor = node.get_nn_input()
+
+			if input_tensor != None:
+				input_tensors.append(input_tensor)
+				self.node_ptrs[i] = node
+			else:
+				self.node_ptrs[i] = None
+				node.evaluate_and_rollout(None)
+		
+		if len(input_tensors) > 0:
+			input_torch = torch.stack(input_tensors).float().to(device)
+			# print(input_torch.dtype)
+			# print(input_torch.device, next(self.nn.parameters()).device)
+			with torch.no_grad():
+				pred = self.nn(input_torch).cpu().numpy()
+
+		index = 0
+		for i in range(len(self.mcts)):
+			m = self.mcts[i]
+			if self.node_ptrs[i] != None:
+				self.node_ptrs[i].evaluate_and_rollout( pred[index] )
+				index += 1
+		
 	def run(self):
-		while not self.root.is_terminal():
-			for i in range(self.EVALUATIONS_PER): # 100 rollouts per move
+
+		while True:
+			for _ in range(self.EVALUATIONS_PER):
 				self.iterate()
-		
-			self.move_to_rand_move()
-		
-		return self.generate_data_set()
+			
+			for m in self.mcts:
+				m.move_to_rand_move()
+			
+			new_mcts = []
+			for m in self.mcts:
+				if m.root.is_terminal():
+					self.finished.append(m)
+				else:
+					new_mcts.append(m)
+			
+			self.mcts = new_mcts
+			
+			if len(self.mcts) == 0:
+				return
 
 class Connect4NN(nn.Module):
+	INTERNAL_CHANNELS = 64
+
 	def __init__(self):
 		super().__init__()
 		
 		self.first_conv = nn.Sequential(
-			nn.Conv2d(in_channels=1, out_channels=64, kernel_size=(3,3), stride=1, padding="same"),
-			nn.BatchNorm2d(64),
+			nn.Conv2d(in_channels=1, out_channels=Connect4NN.INTERNAL_CHANNELS, kernel_size=(3,3), stride=1, padding="same"),
+			nn.BatchNorm2d(Connect4NN.INTERNAL_CHANNELS),
 			nn.ReLU()
 		)
 
-		self.layers = []
-		self.relus = []
+		self.layers = nn.ModuleList()
+		self.relus = nn.ModuleList()
+
 		for i in range(8):
 			self.layers.append(nn.Sequential(
-				nn.Conv2d(in_channels=64, out_channels=64, kernel_size=(3,3), stride=1, padding="same"),
-				nn.BatchNorm2d(64),
+				nn.Conv2d(in_channels=Connect4NN.INTERNAL_CHANNELS, out_channels=Connect4NN.INTERNAL_CHANNELS, kernel_size=(3,3), stride=1, padding="same"),
+				nn.BatchNorm2d(Connect4NN.INTERNAL_CHANNELS),
 				nn.ReLU(),
-				nn.Conv2d(in_channels=64, out_channels=64, kernel_size=(3,3), stride=1, padding="same"),
-				nn.BatchNorm2d(64)
+				nn.Conv2d(in_channels=Connect4NN.INTERNAL_CHANNELS, out_channels=Connect4NN.INTERNAL_CHANNELS, kernel_size=(3,3), stride=1, padding="same"),
+				nn.BatchNorm2d(Connect4NN.INTERNAL_CHANNELS)
 			))
 			self.relus.append(nn.ReLU())
 
 		self.policy_head = nn.Sequential(
-			nn.Conv2d(in_channels=64, out_channels=2, kernel_size=(1,1), stride=1, padding="same"),
+			nn.Conv2d(in_channels=Connect4NN.INTERNAL_CHANNELS, out_channels=2, kernel_size=(1,1), stride=1, padding="same"),
 			nn.BatchNorm2d(2),
 			nn.ReLU()
 		)
@@ -329,7 +377,7 @@ class Connect4NN(nn.Module):
 		self.policy_fc = nn.Linear(in_features=84,out_features=7) # outputs policy
 		
 		self.value_head = nn.Sequential(
-			nn.Conv2d(in_channels=64, out_channels=2, kernel_size=(1,1), stride=1, padding="same"),
+			nn.Conv2d(in_channels=Connect4NN.INTERNAL_CHANNELS, out_channels=2, kernel_size=(1,1), stride=1, padding="same"),
 			nn.BatchNorm2d(2),
 			nn.ReLU()
 		)
@@ -350,31 +398,41 @@ class Connect4NN(nn.Module):
 		ph = self.policy_head(x)
 		vh = self.value_head(x)
 
-		ph = torch.flatten(ph)
-		vh = torch.flatten(vh)
+		ph = torch.flatten(ph,1)
+		vh = torch.flatten(vh,1)
 
+		# print(ph.shape, vh.shape)
 		p = self.policy_fc(ph)
 		v = self.value_fc(vh)
 
-		return torch.cat((p,v))
+		# print(p.shape, v.shape)
+		return torch.cat((p,v),dim=1)
 
-model = Connect4NN()
+model = Connect4NN().to(device)
+# model.eval()
 
+for name, param in model.named_parameters():
+	print(f"Layer: {name}, Weight type: {param.dtype}")
+	break
 
 
 def my_func():
 	print("START!")
+
 	a = time.time()
 
-	for i in range(10):
-		m = MCTS(None,model,100)
-		m.run()
+	m = MCTSManager(20,model,100)
+	m.run()
+
+	# for i in range(100):
+	# 	m = MCTS(None,100)
+	# 	m.run()
 	b = time.time()
 
-	print("FINISHED! ", (b-a)/10)
+	print("FINISHED! ", (b-a))
 
 
-my_func()
+# my_func()
 # for i in range(20):
 # 	a = time.time()
 # 	m = MCTS(None,model,50)
@@ -383,4 +441,4 @@ my_func()
 
 # 	print(b-a)
 
-# cProfile.run("my_func()",None,"tottime")
+cProfile.run("my_func()",None,"tottime")
