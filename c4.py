@@ -1,22 +1,23 @@
+import copy
 import numpy as np
 import random
 import math
 import time
 import cProfile
 import torch.multiprocessing as mp
+import multiprocessing
 import psutil
 
 
 import os
 import torch
 from torch import nn
-from torch.utils.data import DataLoader, random_split
+from torch.utils.data import DataLoader, TensorDataset, Dataset, random_split
 from torchvision import datasets, transforms
 from torchvision.transforms import ToTensor
 from torch.optim import Adam
 
 device = torch.accelerator.current_accelerator().type if torch.accelerator.is_available() else "cpu"
-print(f"Using {device} device")
 
 class Connect4:
 	
@@ -116,7 +117,7 @@ class Connect4:
 
 class MCTSNode:
 
-	EXPLORATION_CONSTANT = 3
+	EXPLORATION_CONSTANT = .5
 	
 	DEFAULT_BOARD = Connect4( np.zeros((6,7)), 1, 0, 1, 1 )
 
@@ -170,11 +171,13 @@ class MCTSNode:
 				self.children.append(MCTSNode(self, game))
 			else:
 				self.children.append(None)
-
+		
 		self.Vsum = (float(output_tensor[7]) * 2 - 1) * self.game.player # from NN (map sigmoid into (-1,1))
 
+		policy = nn.functional.softmax(output_tensor[0:7])
+
 		noise = np.random.dirichlet([.03] * 7)
-		self.P = [ .75 * float(output_tensor[i]) + .25 * float(noise[i]) for i in range(7)]
+		self.P = [ .75 * float(policy[i]) + .25 * float(noise[i]) for i in range(7)]
 		self.N = 1
 
 		if self.parent and not self.disable_backprop:
@@ -250,6 +253,8 @@ class MCTS:
 		
 		if temperature == 0:
 			self.move( self.root.best_move() )
+			return
+		
 		self.move( self.root.rand_move( temperature ) )
 
 	def generate_data_set(self):
@@ -259,18 +264,41 @@ class MCTS:
 		result = self.root.game.get_reward()
 		
 		boards = []
+		outputs = []
 
 		current = self.root
 		while True:
 			# print(current.game)
-			boards.append(torch.from_numpy( current.game.board.astype(float) ) )
+			if current.game.player == 1:
+				boards.append(torch.from_numpy(current.game.board).float().unsqueeze_(0) )
+			else:
+				boards.append(torch.from_numpy( -current.game.board).float().unsqueeze_(0) ) # always encode 1 as the player to go first
+			
+			if current.is_terminal():
+				policy = np.zeros((Connect4.BOARD_WIDTH))
+			else:
+				policy = []
+				for child in current.children:
+					if child != None:
+						policy.append(child.N)
+					else:
+						policy.append(0)
+				policy = np.array(policy)
+				policy = policy / sum(policy)
+			
+			winner = np.array([result * current.game.player])
+
+			output = torch.from_numpy(np.concat((policy,winner))).float()
+
+			outputs.append(output)
+
 			if current.parent:
 				current = current.parent
 			else:
 				break
 
 		X = torch.stack(boards)
-		Y = torch.ones((X.shape[0])) * result
+		Y = torch.stack(outputs)
 
 		return (X,Y)
 
@@ -331,7 +359,17 @@ class MCTSManager:
 			self.mcts = new_mcts
 			
 			if len(self.mcts) == 0:
-				return
+				return self.grab_data()
+	
+	def grab_data(self):
+		Xs = []
+		Ys = []
+		for m in self.finished:
+			(X0,Y0) = m.generate_data_set()
+			Xs.append(X0)
+			Ys.append(Y0)
+		
+		return (torch.concat(Xs),torch.concat(Ys))
 
 class MCTSEvaluator(MCTSManager):
 
@@ -361,7 +399,6 @@ class MCTSEvaluator(MCTSManager):
 				if m.root.is_terminal():
 					self.finished.append(m)
 					self.outcomes += m.root.game.get_reward()
-					# print(m.root.game)
 				else:
 					new_mcts.append(m)
 			
@@ -406,14 +443,14 @@ class Connect4NN(nn.Module):
 		self.value_head = nn.Sequential(
 			nn.Conv2d(in_channels=Connect4NN.INTERNAL_CHANNELS, out_channels=2, kernel_size=(1,1), stride=1, padding="same"),
 			nn.BatchNorm2d(2),
-			nn.ReLU()
+			nn.ReLU(),
+			nn.Sigmoid()
 		)
 
 		self.value_fc = nn.Sequential(
 			nn.Linear(in_features=84, out_features=84),
 			nn.ReLU(),
-			nn.Linear(in_features=84, out_features=1),
-			nn.Sigmoid()
+			nn.Linear(in_features=84, out_features=1)
 		)
 
 	def forward(self, x):
@@ -435,37 +472,40 @@ class Connect4NN(nn.Module):
 		# print(p.shape, v.shape)
 		return torch.cat((p,v),dim=1)
 
-# model1 = Connect4NN()
-# model2 = Connect4NN()
+EPOCH_XS = []
+EPOCH_YS = []
+EPOCHS = 1
 
-# model1.eval()
-# model2.eval()
+TRAINING_EPOCHS = 20
 
-# def my_func(m1, m2):
+MODEL = Connect4NN()
 
-# 	m1 = m1.to(device)
-# 	m2 = m2.to(device)
+def selfplay_PROCESS(m1, xq, yq):
 
-# 	print("START!")
+	print("SELF-PLAY PROCESS STARTED")
 
-# 	a = time.time()
+	m1 = m1.to(device)
+	m1.eval()
 
-# 	m = MCTSEvaluator(20, m1, m2, 100)
-# 	outcomes = m.run()
+	m = MCTSManager(100, m1, 50) # 100 100
+	(X,Y) = m.run()
 
-# 	b = time.time()
+	xq.put(X)
+	yq.put(Y)
 
-# 	print("FINISHED! ", (b-a), outcomes)
+	print("SELF-PLAY PROCESS ENDED")
 
-if __name__ == '__main__':
+def MP_SELFPLAY(model):
 
-	mp.set_start_method('spawn')
+	NUM_THREADS = 5
+
+	Xq = multiprocessing.Queue(NUM_THREADS)
+	Yq = multiprocessing.Queue(NUM_THREADS)
 
 	processes = []
 
-	for i in range(5):
-		pass
-		# processes.append(mp.Process(target=my_func, args=(model1,model2)))
+	for i in range(NUM_THREADS):
+		processes.append(mp.Process(target=selfplay_PROCESS, args=(model,Xq,Yq)))
 
 	for process in processes:
 		process.start()
@@ -473,7 +513,88 @@ if __name__ == '__main__':
 	for process in processes:
 		process.join()
 
-	# with torch.no_grad():
-	# 	print(model1( torch.zeros((1,1,6,7)).to(device) ))
-	# 	print(model1( torch.zeros((1,1,6,7)).to(device) ))
-	# 	print(model1( torch.zeros((1,1,6,7)).to(device) ))
+	Xs = []
+	Ys = []
+	for i in range(NUM_THREADS):
+		Xs.append(Xq.get())
+		Ys.append(Yq.get())
+	
+	X = torch.concat(Xs)
+	Y = torch.concat(Ys)
+	return X,Y
+
+def TRAIN_MODEL_PROCESS(model: Connect4NN, X_tensor: torch.tensor, Y_tensor: torch.tensor, ModelQ: multiprocessing.Queue):
+
+	BATCH_SIZE = 128
+	INIT_LR = 1e-3
+
+	model.to(device)
+
+	model.train()
+
+	train_dataset = TensorDataset(X_tensor, Y_tensor)
+	train_dataloader = DataLoader(train_dataset, shuffle=True, batch_size=BATCH_SIZE)
+
+	opt = Adam(model.parameters(), lr=INIT_LR, weight_decay=.0001)
+
+	def lossFn(output, target):
+		logit_loss = nn.functional.cross_entropy(output[:, 0:7], target[:, 0:7])
+		v_loss = nn.functional.binary_cross_entropy(output[:,7], target[:, 7])
+
+		return v_loss + logit_loss
+	
+	# train_loss = []
+
+	for e in range(TRAINING_EPOCHS):
+		print("TRAINING EPOCH " + str(e) + " START.")
+		totalTrainLoss = 0
+
+		for (x, y) in train_dataloader:
+			(x, y) = (x.to(device), y.to(device))
+
+			pred = model(x)
+
+			loss = lossFn(pred, y)
+
+			opt.zero_grad()
+			loss.backward()
+			opt.step()
+
+			totalTrainLoss += loss
+		
+		print("TRAINING EPOCH " + str(e) + " COMPLETED.\nTOTAL TRAINING LOSS: " + str(totalTrainLoss) + ". AVG: " + str( totalTrainLoss / len(train_dataloader.dataset) ))
+
+	ModelQ.put(model.cpu())
+
+
+if __name__ == '__main__':
+
+	mp.set_start_method('spawn')
+
+	Xprev = torch.load("c4data/X.pt")
+	Yprev = torch.load("c4data/Y.pt")
+
+	modelQ = multiprocessing.Queue(2)
+
+	training_process = mp.Process(target=TRAIN_MODEL_PROCESS, args=(MODEL,Xprev,Yprev,modelQ))
+	training_process.start()
+	training_process.join()
+
+	new_model = modelQ.get()
+	torch.save(new_model.state_dict(), "c4data/model.pth")
+
+	# for i in range(EPOCHS):
+	# 	start = time.time()
+	# 	print("EPOCH " + str(i))
+	# 	(X,Y) = MP_SELFPLAY(MODEL)
+
+	# 	EPOCH_XS.append(X)
+	# 	EPOCH_YS.append(Y)
+
+	# 	torch.save(X, "c4data/X.pt")
+	# 	torch.save(Y, "c4data/Y.pt")
+
+	# 	end = time.time()
+	# 	print("EPOCH " + str(i) + " END. " + str(end-start) + " SECONDS ELAPSED.")
+
+	
