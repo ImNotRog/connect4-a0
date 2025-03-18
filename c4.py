@@ -7,6 +7,7 @@ import cProfile
 import torch.multiprocessing as mp
 import multiprocessing
 import psutil
+from colorama import Fore, Back, Style
 
 
 import os
@@ -174,7 +175,10 @@ class MCTSNode:
 		
 		self.Vsum = (float(output_tensor[7]) * 2 - 1) * self.game.player # from NN (map sigmoid into (-1,1))
 
-		policy = nn.functional.softmax(output_tensor[0:7])
+		policy = output_tensor[0:7] - max(output_tensor[0:7])
+		policy = np.exp(policy)
+		policy = policy / sum(policy)
+		# print(policy)
 
 		noise = np.random.dirichlet([.03] * 7)
 		self.P = [ .75 * float(policy[i]) + .25 * float(noise[i]) for i in range(7)]
@@ -286,7 +290,7 @@ class MCTS:
 				policy = np.array(policy)
 				policy = policy / sum(policy)
 			
-			winner = np.array([result * current.game.player])
+			winner = np.array([( result * current.game.player + 1) / 2])
 
 			output = torch.from_numpy(np.concat((policy,winner))).float()
 
@@ -443,14 +447,14 @@ class Connect4NN(nn.Module):
 		self.value_head = nn.Sequential(
 			nn.Conv2d(in_channels=Connect4NN.INTERNAL_CHANNELS, out_channels=2, kernel_size=(1,1), stride=1, padding="same"),
 			nn.BatchNorm2d(2),
-			nn.ReLU(),
-			nn.Sigmoid()
+			nn.ReLU()
 		)
 
 		self.value_fc = nn.Sequential(
 			nn.Linear(in_features=84, out_features=84),
 			nn.ReLU(),
-			nn.Linear(in_features=84, out_features=1)
+			nn.Linear(in_features=84, out_features=1),
+			nn.Sigmoid()
 		)
 
 	def forward(self, x):
@@ -474,37 +478,39 @@ class Connect4NN(nn.Module):
 
 EPOCH_XS = []
 EPOCH_YS = []
-EPOCHS = 1
 
-TRAINING_EPOCHS = 20
+TRAINING_EPOCHS = 10
+NUM_SELFPLAY_THREADS = 4
+NUM_GAMES_PER_SELFPLAY_THREAD = 100
+NUM_ITERATIONS_PER_MCTS = 50
+EVALUATION_NUM_GAMES = 64
+BATCH_SIZE = 256
+INIT_LR = 1e-3
 
-MODEL = Connect4NN()
+BEST_MODEL = Connect4NN()
+BEST_MODEL.load_state_dict(torch.load('c4data/CURRENT_MODEL.pth', weights_only=True))
 
 def selfplay_PROCESS(m1, xq, yq):
-
-	print("SELF-PLAY PROCESS STARTED")
 
 	m1 = m1.to(device)
 	m1.eval()
 
-	m = MCTSManager(100, m1, 50) # 100 100
+	m = MCTSManager(NUM_GAMES_PER_SELFPLAY_THREAD, m1, NUM_ITERATIONS_PER_MCTS) # 100 100
 	(X,Y) = m.run()
 
 	xq.put(X)
 	yq.put(Y)
 
-	print("SELF-PLAY PROCESS ENDED")
+	# print(Fore.MAGENTA + "Self-play process ended.")
 
 def MP_SELFPLAY(model):
 
-	NUM_THREADS = 5
-
-	Xq = multiprocessing.Queue(NUM_THREADS)
-	Yq = multiprocessing.Queue(NUM_THREADS)
+	Xq = multiprocessing.Queue(NUM_SELFPLAY_THREADS)
+	Yq = multiprocessing.Queue(NUM_SELFPLAY_THREADS)
 
 	processes = []
 
-	for i in range(NUM_THREADS):
+	for i in range(NUM_SELFPLAY_THREADS):
 		processes.append(mp.Process(target=selfplay_PROCESS, args=(model,Xq,Yq)))
 
 	for process in processes:
@@ -515,7 +521,7 @@ def MP_SELFPLAY(model):
 
 	Xs = []
 	Ys = []
-	for i in range(NUM_THREADS):
+	for i in range(NUM_SELFPLAY_THREADS):
 		Xs.append(Xq.get())
 		Ys.append(Yq.get())
 	
@@ -524,9 +530,8 @@ def MP_SELFPLAY(model):
 	return X,Y
 
 def TRAIN_MODEL_PROCESS(model: Connect4NN, X_tensor: torch.tensor, Y_tensor: torch.tensor, ModelQ: multiprocessing.Queue):
-
-	BATCH_SIZE = 128
-	INIT_LR = 1e-3
+	print(Fore.WHITE + Back.BLUE + "TRAINING PROCESS INITIATED." + Back.RESET)
+	
 
 	model.to(device)
 
@@ -539,14 +544,12 @@ def TRAIN_MODEL_PROCESS(model: Connect4NN, X_tensor: torch.tensor, Y_tensor: tor
 
 	def lossFn(output, target):
 		logit_loss = nn.functional.cross_entropy(output[:, 0:7], target[:, 0:7])
-		v_loss = nn.functional.binary_cross_entropy(output[:,7], target[:, 7])
+		v_loss = nn.functional.binary_cross_entropy(output[:,7], target[:,7])
 
 		return v_loss + logit_loss
-	
-	# train_loss = []
 
 	for e in range(TRAINING_EPOCHS):
-		print("TRAINING EPOCH " + str(e) + " START.")
+		# print(Fore.BLUE + "Training epoch " + str(e) + " started.")
 		totalTrainLoss = 0
 
 		for (x, y) in train_dataloader:
@@ -562,39 +565,84 @@ def TRAIN_MODEL_PROCESS(model: Connect4NN, X_tensor: torch.tensor, Y_tensor: tor
 
 			totalTrainLoss += loss
 		
-		print("TRAINING EPOCH " + str(e) + " COMPLETED.\nTOTAL TRAINING LOSS: " + str(totalTrainLoss) + ". AVG: " + str( totalTrainLoss / len(train_dataloader.dataset) ))
+		print(Fore.BLUE + "Training epoch " + str(e) + " completed. Training loss: " + str(float(totalTrainLoss)) + ". Avg: " + str(float(totalTrainLoss / len(train_dataloader.dataset) * BATCH_SIZE) ))
 
 	ModelQ.put(model.cpu())
 
+	print(Fore.BLUE + "Training process terminated.")
+
+def EVALUATE_MODELS_PROCESS(model1: Connect4NN, model2: Connect4NN, ModelQ: multiprocessing.Queue):
+
+	print(Fore.WHITE + Back.GREEN + "EVALUATION THREAD BEGIN." + Back.RESET)
+	model1.to(device)
+	model2.to(device)
+
+	evaluator1 = MCTSEvaluator(EVALUATION_NUM_GAMES, model1, model2, 50)
+	evaluator2 = MCTSEvaluator(EVALUATION_NUM_GAMES, model2, model1, 50)
+	
+	outcomes = evaluator1.run()
+	negoutcomes = evaluator2.run()
+
+	total_1_won = outcomes - negoutcomes
+
+	if total_1_won < -.05 * EVALUATION_NUM_GAMES: # won games - lost games < -15
+		print(Fore.WHITE + Back.GREEN + "NEW MODEL BEAT OUT OLD MODEL." + Back.RESET)
+		ModelQ.put(model2.cpu())
+	else:
+		print(Fore.WHITE + Back.GREEN + "Old model beat out new model. No change." + Back.RESET)
+		ModelQ.put(model1.cpu())
 
 if __name__ == '__main__':
 
 	mp.set_start_method('spawn')
 
-	Xprev = torch.load("c4data/X.pt")
-	Yprev = torch.load("c4data/Y.pt")
-
+	CURRENT_MODEL = BEST_MODEL
 	modelQ = multiprocessing.Queue(2)
+	evaluationQ = multiprocessing.Queue(2)
 
-	training_process = mp.Process(target=TRAIN_MODEL_PROCESS, args=(MODEL,Xprev,Yprev,modelQ))
-	training_process.start()
-	training_process.join()
+	TRAINING_INITIATED = False
+	TRAINING_PROCESS = None
+	EVALUATING_PROCESS = None
 
-	new_model = modelQ.get()
-	torch.save(new_model.state_dict(), "c4data/model.pth")
+	while True:
 
-	# for i in range(EPOCHS):
-	# 	start = time.time()
-	# 	print("EPOCH " + str(i))
-	# 	(X,Y) = MP_SELFPLAY(MODEL)
+		start = time.time()
+		print(Fore.WHITE + Back.RED + "SELF PLAY EPOCH INITIATED." + Back.RESET)
+		(X,Y) = MP_SELFPLAY(BEST_MODEL)
 
-	# 	EPOCH_XS.append(X)
-	# 	EPOCH_YS.append(Y)
+		EPOCH_XS.append(X)
+		EPOCH_YS.append(Y)
 
-	# 	torch.save(X, "c4data/X.pt")
-	# 	torch.save(Y, "c4data/Y.pt")
+		# torch.save(X, "c4data/X.pt")
+		# torch.save(Y, "c4data/Y.pt")
 
-	# 	end = time.time()
-	# 	print("EPOCH " + str(i) + " END. " + str(end-start) + " SECONDS ELAPSED.")
+		end = time.time()
+		print(Fore.RED + "Self-play epoch ended. " + str(end-start) + " second elapsed.")
+
+		if EVALUATING_PROCESS != None and not EVALUATING_PROCESS.is_alive():
+			# we've finished evaluating process
+			print(Fore.GREEN + "Writing best model to memory. Evaluation Q Empty? " + str(evaluationQ.empty()))
+			BEST_MODEL = evaluationQ.get(True)
+			torch.save(CURRENT_MODEL.state_dict(), "c4data/BEST_MODEL.pth")
+			EVALUATING_PROCESS = None
+
+		if not TRAINING_INITIATED or not TRAINING_PROCESS.is_alive():
+
+			if TRAINING_INITIATED: # Get model
+				print(Fore.BLUE + "Writing current model to memory. Model Q Empty? " + str(modelQ.empty()))
+				CURRENT_MODEL = modelQ.get(True)
+				torch.save(CURRENT_MODEL.state_dict(), "c4data/CURRENT_MODEL.pth")
+
+			if TRAINING_INITIATED and EVALUATING_PROCESS == None:
+				EVALUATING_PROCESS = mp.Process(target=EVALUATE_MODELS_PROCESS, args=(BEST_MODEL,CURRENT_MODEL,evaluationQ))
+				EVALUATING_PROCESS.start()
+			
+			x_data = torch.concat(EPOCH_XS[-4:],dim=0)
+			y_data = torch.concat(EPOCH_YS[-4:],dim=0)
+			TRAINING_PROCESS = mp.Process(target=TRAIN_MODEL_PROCESS, args=(CURRENT_MODEL,x_data,y_data,modelQ))
+			TRAINING_PROCESS.start()
+
+			TRAINING_INITIATED = True
+		
 
 	
