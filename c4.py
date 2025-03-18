@@ -118,7 +118,7 @@ class Connect4:
 
 class MCTSNode:
 
-	EXPLORATION_CONSTANT = .5
+	EXPLORATION_CONSTANT = 4
 	
 	DEFAULT_BOARD = Connect4( np.zeros((6,7)), 1, 0, 1, 1 )
 
@@ -144,7 +144,7 @@ class MCTSNode:
 		# UCB = Q + c * P/(1+N)
 		q = 0
 		if self.children[child_index].N:
-			q = (self.children[child_index].Vsum/self.children[child_index].N * self.game.player + 1) / 2 # map q -> [0,1]
+			q = (self.children[child_index].Vsum/self.children[child_index].N * self.game.player) 
 		u = MCTSNode.EXPLORATION_CONSTANT * self.P[child_index] * math.sqrt(self.N) / (1 + self.children[child_index].N)
 		ucb = q + u
 
@@ -479,12 +479,12 @@ class Connect4NN(nn.Module):
 EPOCH_XS = []
 EPOCH_YS = []
 
-TRAINING_EPOCHS = 10
+TRAINING_EPOCHS = 32
 NUM_SELFPLAY_THREADS = 4
 NUM_GAMES_PER_SELFPLAY_THREAD = 100
-NUM_ITERATIONS_PER_MCTS = 50
+NUM_ITERATIONS_PER_MCTS = 30
 EVALUATION_NUM_GAMES = 64
-BATCH_SIZE = 256
+BATCH_SIZE = 512
 INIT_LR = 1e-3
 
 BEST_MODEL = Connect4NN()
@@ -613,9 +613,6 @@ if __name__ == '__main__':
 		EPOCH_XS.append(X)
 		EPOCH_YS.append(Y)
 
-		# torch.save(X, "c4data/X.pt")
-		# torch.save(Y, "c4data/Y.pt")
-
 		end = time.time()
 		print(Fore.RED + "Self-play epoch ended. " + str(end-start) + " second elapsed.")
 
@@ -637,8 +634,8 @@ if __name__ == '__main__':
 				EVALUATING_PROCESS = mp.Process(target=EVALUATE_MODELS_PROCESS, args=(BEST_MODEL,CURRENT_MODEL,evaluationQ))
 				EVALUATING_PROCESS.start()
 			
-			x_data = torch.concat(EPOCH_XS[-4:],dim=0)
-			y_data = torch.concat(EPOCH_YS[-4:],dim=0)
+			x_data = torch.concat(EPOCH_XS[-8:],dim=0)
+			y_data = torch.concat(EPOCH_YS[-8:],dim=0)
 			TRAINING_PROCESS = mp.Process(target=TRAIN_MODEL_PROCESS, args=(CURRENT_MODEL,x_data,y_data,modelQ))
 			TRAINING_PROCESS.start()
 
