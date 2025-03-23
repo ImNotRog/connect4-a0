@@ -12,14 +12,16 @@ model = Connect4NN()
 
 model.load_state_dict(torch.load('c4data/CURRENT_MODEL.pth', weights_only=True))
 
-model_input = torch.tensor([[ -1,  -1, -1, 0, 0, 0, 0],
-         [ 0.,  1.,  0., 0.,  0.,  0.,  0.],
-         [ 0.,  1,  0.,  0.,  0.,  0.,  0.],
-         [ 0.,  0.,  0.,  0.,  0.,  0.,  0.],
-         [ 0.,  0,  0.,  0.,  0.,  0.,  0.],
-         [ 0.,  0.,  0.,  0.,  0.,  0.,  0.]]).float().unsqueeze_(0).unsqueeze_(0)
+model_input = torch.tensor([
+        [ -1, -1, 0, 0, 1, 1, 1],
+        [ -1.,  1., 0., 0.,  0.,  0.,  0.],
+        [ -1.,  0,  0.,  0.,  0.,  0.,  0.],
+        [ 0.,  0.,  0.,  0.,  0.,  0.,  0.],
+        [ 0.,  0,  0.,  0.,  0.,  0.,  0.],
+        [ 0.,  0.,  0.,  0.,  0.,  0.,  0.]]).float().unsqueeze_(0).unsqueeze_(0)
 
 pred = model(model_input)
 print(pred)
+# print(next(model.parameters())[0])
 
 

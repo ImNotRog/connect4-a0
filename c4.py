@@ -17,7 +17,7 @@ from torch import nn
 from torch.utils.data import DataLoader, TensorDataset, Dataset, random_split
 from torchvision import datasets, transforms
 from torchvision.transforms import ToTensor
-from torch.optim import Adam
+from torch.optim import Adam, SGD
 
 device = torch.accelerator.current_accelerator().type if torch.accelerator.is_available() else "cpu"
 
@@ -142,10 +142,10 @@ class MCTSNode:
 		# if self.is_leaf() or self.children[child_index] == None:
 		# 	raise Exception("Attempted to call UCB on a nonexistent node!")
 
-		# UCB = Q + c * P/(1+N)
+		# UCB = Q + c * P sqrt(N) /(1+N)
 		q = 0
 		if self.children[child_index].N:
-			q = (self.children[child_index].Vsum/self.children[child_index].N * self.game.player) 
+			q = (self.children[child_index].Vsum/self.children[child_index].N * self.game.player + 1)/2
 		u = MCTSNode.EXPLORATION_CONSTANT * self.P[child_index] * math.sqrt(self.N) / (1 + self.children[child_index].N)
 		ucb = q + u
 
@@ -181,7 +181,7 @@ class MCTSNode:
 		policy = policy / sum(policy)
 		# print(policy)
 
-		noise = np.random.dirichlet([.03] * 7)
+		noise = np.random.dirichlet([.3] * 7)
 		self.P = [ .75 * float(policy[i]) + .25 * float(noise[i]) for i in range(7)]
 		self.N = 1
 
@@ -271,7 +271,7 @@ class MCTS:
 		boards = []
 		outputs = []
 
-		current = self.root
+		current = self.root.parent
 		while True:
 			# print(current.game)
 			if current.game.player == 1:
@@ -279,17 +279,17 @@ class MCTS:
 			else:
 				boards.append(torch.from_numpy( -current.game.board).float().unsqueeze_(0) ) # always encode 1 as the player to go first
 			
-			if current.is_terminal():
-				policy = np.zeros((Connect4.BOARD_WIDTH))
-			else:
-				policy = []
-				for child in current.children:
-					if child != None:
-						policy.append(child.N)
-					else:
-						policy.append(0)
-				policy = np.array(policy)
-				policy = policy / sum(policy)
+			# if current.is_terminal():
+			# 	policy = np.zeros((Connect4.BOARD_WIDTH))
+			# else:
+			policy = []
+			for child in current.children:
+				if child != None:
+					policy.append(child.N)
+				else:
+					policy.append(0)
+			policy = np.array(policy)
+			policy = policy / sum(policy)
 			
 			winner = np.array([( result * current.game.player + 1) / 2])
 
@@ -376,7 +376,7 @@ class MCTSManager:
 		
 		return (torch.concat(Xs),torch.concat(Ys))
 
-class MCTSEvaluator(MCTSManager):
+class MCTSEvaluator(MCTSManager): # THIS DOESNT MAKE SENSE
 
 	def __init__(self, num, nn1, nn2, evaluations_per = 100):
 		super().__init__(num, None, evaluations_per)
@@ -485,16 +485,16 @@ class Connect4NN(nn.Module):
 EPOCH_XS = []
 EPOCH_YS = []
 
-TRAINING_EPOCHS = 8
+TRAINING_EPOCHS = 32 # 32
 NUM_SELFPLAY_THREADS = 4
-NUM_GAMES_PER_SELFPLAY_THREAD = 100
-NUM_ITERATIONS_PER_MCTS = 100
+NUM_GAMES_PER_SELFPLAY_THREAD = 128 # 128
+NUM_ITERATIONS_PER_MCTS = 100 # 100
 EVALUATION_NUM_GAMES = 64
 BATCH_SIZE = 512
 INIT_LR = 1e-3
 
 BEST_MODEL = Connect4NN()
-# BEST_MODEL.load_state_dict(torch.load('c4data/CURRENT_MODEL.pth', weights_only=True))
+BEST_MODEL.load_state_dict(torch.load('c4data/BEST_MODEL.pth', weights_only=True))
 
 def selfplay_PROCESS(m1, xq, yq):
 
@@ -538,7 +538,6 @@ def MP_SELFPLAY(model):
 def TRAIN_MODEL_PROCESS(model: Connect4NN, X_tensor: torch.tensor, Y_tensor: torch.tensor, ModelQ: multiprocessing.Queue):
 	print(Fore.WHITE + Back.BLUE + "TRAINING PROCESS INITIATED." + Back.RESET)
 	
-
 	model.to(device)
 
 	model.train()
@@ -546,7 +545,7 @@ def TRAIN_MODEL_PROCESS(model: Connect4NN, X_tensor: torch.tensor, Y_tensor: tor
 	train_dataset = TensorDataset(X_tensor, Y_tensor)
 	train_dataloader = DataLoader(train_dataset, shuffle=True, batch_size=BATCH_SIZE)
 
-	opt = Adam(model.parameters(), lr=INIT_LR, weight_decay=.0001)
+	opt = torch.optim.SGD(model.parameters(), lr=INIT_LR, momentum=0.9)
 
 	def lossFn(output, target):
 		logit_loss = nn.functional.cross_entropy(output[:, 0:7], target[:, 0:7])
@@ -577,30 +576,41 @@ def TRAIN_MODEL_PROCESS(model: Connect4NN, X_tensor: torch.tensor, Y_tensor: tor
 
 	print(Fore.BLUE + "Training process terminated.")
 
-def EVALUATE_MODELS_PROCESS(model1: Connect4NN, model2: Connect4NN, ModelQ: multiprocessing.Queue):
+# def EVALUATE_MODELS_PROCESS(model1: Connect4NN, model2: Connect4NN, ModelQ: multiprocessing.Queue):
 
-	print(Fore.WHITE + Back.GREEN + "EVALUATION THREAD BEGIN." + Back.RESET)
-	model1.to(device)
-	model2.to(device)
+# 	print(Fore.WHITE + Back.GREEN + "EVALUATION THREAD BEGIN." + Back.RESET)
+# 	model1.to(device)
+# 	model2.to(device)
 
-	evaluator1 = MCTSEvaluator(EVALUATION_NUM_GAMES, model1, model2, 50)
-	evaluator2 = MCTSEvaluator(EVALUATION_NUM_GAMES, model2, model1, 50)
+# 	evaluator1 = MCTSEvaluator(EVALUATION_NUM_GAMES, model1, model2, 50)
+# 	evaluator2 = MCTSEvaluator(EVALUATION_NUM_GAMES, model2, model1, 50)
 	
-	outcomes = evaluator1.run()
-	negoutcomes = evaluator2.run()
+# 	outcomes = evaluator1.run()
+# 	negoutcomes = evaluator2.run()
 
-	total_1_won = outcomes - negoutcomes
+# 	total_1_won = outcomes - negoutcomes
 
-	if total_1_won < -.05 * EVALUATION_NUM_GAMES: # won games - lost games < -15
-		print(Fore.WHITE + Back.GREEN + "NEW MODEL BEAT OUT OLD MODEL." + Back.RESET)
-		ModelQ.put(model2.cpu())
-	else:
-		print(Fore.WHITE + Back.GREEN + "Old model beat out new model. No change." + Back.RESET)
-		ModelQ.put(model1.cpu())
+# 	if total_1_won < -.05 * EVALUATION_NUM_GAMES: # won games - lost games < -15
+# 		print(Fore.WHITE + Back.GREEN + "NEW MODEL BEAT OUT OLD MODEL." + Back.RESET)
+# 		ModelQ.put(model2.cpu())
+# 	else:
+# 		print(Fore.WHITE + Back.GREEN + "Old model beat out new model. No change." + Back.RESET)
+# 		ModelQ.put(model1.cpu())
 
 if __name__ == '__main__':
 
 	mp.set_start_method('spawn')
+
+	# for i in range(3):
+	# 	start = time.time()
+	# 	print(Fore.WHITE + Back.RED + "SELF PLAY EPOCH INITIATED." + Back.RESET)
+	# 	(X,Y) = MP_SELFPLAY(BEST_MODEL)
+
+	# 	EPOCH_XS.append(X)
+	# 	EPOCH_YS.append(Y)
+
+	# 	end = time.time()
+	# 	print(Fore.RED + "Self-play epoch ended. " + str(end-start) + " second elapsed.")
 
 	CURRENT_MODEL = BEST_MODEL
 	modelQ = multiprocessing.Queue(2)
@@ -614,7 +624,7 @@ if __name__ == '__main__':
 
 		start = time.time()
 		print(Fore.WHITE + Back.RED + "SELF PLAY EPOCH INITIATED." + Back.RESET)
-		(X,Y) = MP_SELFPLAY(BEST_MODEL)
+		(X,Y) = MP_SELFPLAY(CURRENT_MODEL)
 
 		EPOCH_XS.append(X)
 		EPOCH_YS.append(Y)
@@ -622,12 +632,12 @@ if __name__ == '__main__':
 		end = time.time()
 		print(Fore.RED + "Self-play epoch ended. " + str(end-start) + " second elapsed.")
 
-		if EVALUATING_PROCESS != None and not EVALUATING_PROCESS.is_alive():
-			# we've finished evaluating process
-			print(Fore.GREEN + "Writing best model to memory. Evaluation Q Empty? " + str(evaluationQ.empty()))
-			BEST_MODEL = evaluationQ.get(True)
-			torch.save(CURRENT_MODEL.state_dict(), "c4data/BEST_MODEL.pth")
-			EVALUATING_PROCESS = None
+		# if EVALUATING_PROCESS != None and not EVALUATING_PROCESS.is_alive():
+		# 	# we've finished evaluating process
+		# 	print(Fore.GREEN + "Writing best model to memory. Evaluation Q Empty? " + str(evaluationQ.empty()))
+		# 	BEST_MODEL = evaluationQ.get(True)
+		# 	torch.save(BEST_MODEL.state_dict(), "c4data/BEST_MODEL.pth")
+		# 	EVALUATING_PROCESS = None
 
 		if not TRAINING_INITIATED or not TRAINING_PROCESS.is_alive():
 
@@ -636,9 +646,9 @@ if __name__ == '__main__':
 				CURRENT_MODEL = modelQ.get(True)
 				torch.save(CURRENT_MODEL.state_dict(), "c4data/CURRENT_MODEL.pth")
 
-			if TRAINING_INITIATED and EVALUATING_PROCESS == None:
-				EVALUATING_PROCESS = mp.Process(target=EVALUATE_MODELS_PROCESS, args=(BEST_MODEL,CURRENT_MODEL,evaluationQ))
-				EVALUATING_PROCESS.start()
+			# if TRAINING_INITIATED and EVALUATING_PROCESS == None:
+			# 	EVALUATING_PROCESS = mp.Process(target=EVALUATE_MODELS_PROCESS, args=(BEST_MODEL,CURRENT_MODEL,evaluationQ))
+			# 	EVALUATING_PROCESS.start()
 			
 			x_data = torch.concat(EPOCH_XS[-16:],dim=0)
 			y_data = torch.concat(EPOCH_YS[-16:],dim=0)
@@ -646,6 +656,6 @@ if __name__ == '__main__':
 			TRAINING_PROCESS.start()
 
 			TRAINING_INITIATED = True
-		
+
 
 	
