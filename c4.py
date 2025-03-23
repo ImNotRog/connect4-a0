@@ -9,7 +9,8 @@ import multiprocessing
 import psutil
 from colorama import Fore, Back, Style
 
-
+# TODO: THere must be something wrong with the way I use cross-entropy loss.
+# TODO: Exploration parameter must be fine tuned
 import os
 import torch
 from torch import nn
@@ -118,7 +119,7 @@ class Connect4:
 
 class MCTSNode:
 
-	EXPLORATION_CONSTANT = 4
+	EXPLORATION_CONSTANT = 2
 	
 	DEFAULT_BOARD = Connect4( np.zeros((6,7)), 1, 0, 1, 1 )
 
@@ -460,8 +461,13 @@ class Connect4NN(nn.Module):
 	def forward(self, x):
 		x = self.first_conv(x)
 
-		for layer in self.layers:
+		for i in range(len(self.layers)):
+			layer = self.layers[i]
+			relu = self.relus[i]
+			y = x
 			x = layer(x)
+			x += y
+			x = relu(x)
 		
 		ph = self.policy_head(x)
 		vh = self.value_head(x)
@@ -479,16 +485,16 @@ class Connect4NN(nn.Module):
 EPOCH_XS = []
 EPOCH_YS = []
 
-TRAINING_EPOCHS = 32
+TRAINING_EPOCHS = 8
 NUM_SELFPLAY_THREADS = 4
 NUM_GAMES_PER_SELFPLAY_THREAD = 100
-NUM_ITERATIONS_PER_MCTS = 30
+NUM_ITERATIONS_PER_MCTS = 100
 EVALUATION_NUM_GAMES = 64
 BATCH_SIZE = 512
 INIT_LR = 1e-3
 
 BEST_MODEL = Connect4NN()
-BEST_MODEL.load_state_dict(torch.load('c4data/CURRENT_MODEL.pth', weights_only=True))
+# BEST_MODEL.load_state_dict(torch.load('c4data/CURRENT_MODEL.pth', weights_only=True))
 
 def selfplay_PROCESS(m1, xq, yq):
 
@@ -544,7 +550,7 @@ def TRAIN_MODEL_PROCESS(model: Connect4NN, X_tensor: torch.tensor, Y_tensor: tor
 
 	def lossFn(output, target):
 		logit_loss = nn.functional.cross_entropy(output[:, 0:7], target[:, 0:7])
-		v_loss = nn.functional.binary_cross_entropy(output[:,7], target[:,7])
+		v_loss = nn.functional.mse_loss(output[:,7],target[:,7])
 
 		return v_loss + logit_loss
 
@@ -634,8 +640,8 @@ if __name__ == '__main__':
 				EVALUATING_PROCESS = mp.Process(target=EVALUATE_MODELS_PROCESS, args=(BEST_MODEL,CURRENT_MODEL,evaluationQ))
 				EVALUATING_PROCESS.start()
 			
-			x_data = torch.concat(EPOCH_XS[-8:],dim=0)
-			y_data = torch.concat(EPOCH_YS[-8:],dim=0)
+			x_data = torch.concat(EPOCH_XS[-16:],dim=0)
+			y_data = torch.concat(EPOCH_YS[-16:],dim=0)
 			TRAINING_PROCESS = mp.Process(target=TRAIN_MODEL_PROCESS, args=(CURRENT_MODEL,x_data,y_data,modelQ))
 			TRAINING_PROCESS.start()
 
