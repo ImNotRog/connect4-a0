@@ -8,6 +8,7 @@ import torch.multiprocessing as mp
 import multiprocessing
 import psutil
 from colorama import Fore, Back, Style
+import os
 
 import torch
 from torch import nn
@@ -174,6 +175,9 @@ class ResidualBlock(nn.Module):
 		return self.relu(output + x)
 
 class MCTSBatchSelfPlayer:
+
+	KEEP_PROBS = .5
+
 	def __init__(self, batch_size, model: Connect4NN, evaluations_per):
 		self.roots = [MCTSNode(None, Connect4(np.zeros((Connect4.BOARD_HEIGHT, Connect4.BOARD_WIDTH)), 1)) for i in range(batch_size)]
 		self.finished_roots = []
@@ -228,13 +232,33 @@ class MCTSBatchSelfPlayer:
 			for _ in range(self.evaluations_per):
 				self.iterate()
 
-			input("MOVING")
-			for root in self.roots:
-				print(root)
 			self.move()
 
 			if len(self.roots) == 0:
-				return
+				return self.get_data()
+	
+	def get_data(self):
+		Xs = []
+		Ys = []
+		Zs = []
+
+		for root in self.finished_roots:
+			reward = root._game.reward()
+			current = root._parent
+			while True:
+
+				if random.random() < MCTSBatchSelfPlayer.KEEP_PROBS:
+					(X, Y, Z) = current.output_tensor_representation(reward)
+					Xs.append(X)
+					Ys.append(Y)
+					Zs.append(Z)
+
+				if current._parent != None:
+					current = current._parent
+				else:
+					break
+		
+		return (torch.stack(Xs), torch.stack(Ys), torch.stack(Zs))
 
 class MCTSNode:
 
@@ -348,7 +372,9 @@ class MCTSNode:
 		return self._game.tensor_representation()
 
 	def output_tensor_representation(self, reward):
-		Ns = np.array([child._N if child != None else 0 for child in self.children])
+		if self.is_terminal():
+			return None
+		Ns = np.array([float(child._N) if child != None else 0 for child in self._children])
 		Ns /= Ns.sum()
 		return (self._game.tensor_representation(), torch.from_numpy(Ns).float(), torch.tensor([reward]).float())
 
@@ -418,7 +444,8 @@ class MCTSOneSidedBatchComparator:
 		
 		self.m1.roots = new_roots_1
 		self.m2.roots = new_roots_2
-			
+
+# Something's wrong with this... It doesn't follow a binomial distribution so the trials are probably not independent		
 def MCTSCompare(batch_size, model1: Connect4NN, model2: Connect4NN, evaluations_per):
 	m1 = MCTSOneSidedBatchComparator(batch_size,model1,model2,evaluations_per//2)
 	m2 = MCTSOneSidedBatchComparator(batch_size,model2,model1,evaluations_per//2)
@@ -428,104 +455,153 @@ def MCTSCompare(batch_size, model1: Connect4NN, model2: Connect4NN, evaluations_
 	
 	return a-b
 
-model = Connect4NN()
-model.load_state_dict(torch.load('data/test.pth'))
-model.to(DEVICE)
+EPOCH_XS = []
+EPOCH_YS = []
+EPOCH_ZS = []
 
-# model2 = Connect4NN()
-# model2.to(DEVICE)
+TRAINING_EPOCHS = 32
+NUM_SELFPLAY_THREADS = 4
+NUM_GAMES_PER_SELFPLAY_THREAD = 64
+NUM_ITERATIONS_PER_MCTS = 50
 
-# g = Connect4(np.zeros((6,7)),1)
-# print(g.tensor_representation())
-# boards = [g.tensor_representation()] * 10
-# a = torch.stack(boards).to(DEVICE)
-# print(a.shape)
-# output = (model(a))
-# print(output)
+EVALUATION_NUM_GAMES = 64
 
-a = MCTSBatchSelfPlayer(10,model,100)
-a.run()
+BATCH_SIZE = 256
+INIT_LR = 1e-3
 
-# m = MCTSBatchSelfPlayer(10, model, 10)
-# m.run()
-# for i in range(20):
-# 	print(MCTSCompare(20, model2, model, 50))
+EPOCHS_TRAINED = 16
+MIN_EPOCHS_BEFORE_TRAINING = 4
 
-# model.to(device)
+BEST_MODEL = Connect4NN()
+BEST_MODEL.load_state_dict(torch.load('models/best_model.pth'))
+CURRENT_MODEL = Connect4NN()
+CURRENT_MODEL.load_state_dict( BEST_MODEL.state_dict() )
+CURRENT_MODEL.to(DEVICE)
 
-# train_dataset = TensorDataset(X, Y, Z)
-# train_dataloader = DataLoader(train_dataset, shuffle=True, batch_size=1)
+# TRAINING STUFF
+OPT = torch.optim.Adam(CURRENT_MODEL.parameters(), lr=INIT_LR)
+OPT.load_state_dict(torch.load('models/optimizer.pth'))
+cross = nn.CrossEntropyLoss()
+mse = nn.MSELoss()
 
-# opt = torch.optim.Adam(model.parameters(), lr=0.0001)
-# opt.load_state_dict(torch.load('data/testopt.pth'))
+GENERATION_PROCESS = None
 
-# cross = nn.CrossEntropyLoss()
-# mse = nn.MSELoss()
+TRAINING_DATALOADER = None
 
-# model.eval()
+def SINGLE_SELFPLAY_PROCESS(model, dataQueue):
 
-# for e in range(20):
-# 	totalTrainLoss = 0
+	model = model.to(DEVICE)
+	model.eval()
 
-# 	for (x, y, z) in train_dataloader:
-# 		(x, y, z) = (x.float().to(device), y.float().to(device), z.unsqueeze_(1).float().to(device))
+	m = MCTSBatchSelfPlayer(NUM_GAMES_PER_SELFPLAY_THREAD, model, NUM_ITERATIONS_PER_MCTS)
+	data = m.run()
 
-# 		(policy_pred, value_pred) = model(x)
+	dataQueue.put(data)
 
-# 		print(x)
-# 		print(policy_pred, value_pred)
-# 		input()
+def MP_SELFPLAY(model, dataQueue):
 
-	# 	loss = cross(policy_pred, y) + mse(value_pred, z)
+	print(Fore.WHITE + Back.RED + "SELF PLAY EPOCH INITIATED." + Back.RESET)
 
-	# 	opt.zero_grad()
-	# 	loss.backward()
-	# 	opt.step()
+	start = time.time()
 
-	# 	totalTrainLoss += loss
+	subDataQueue = multiprocessing.Queue(NUM_SELFPLAY_THREADS)
+
+	processes = []
+
+	for i in range(NUM_SELFPLAY_THREADS):
+		processes.append(mp.Process(target=SINGLE_SELFPLAY_PROCESS, args=(model,subDataQueue)))
+
+	for process in processes:
+		process.start()
+
+	for process in processes:
+		process.join()
+
+	Xs = []
+	Ys = []
+	Zs = []
+	for i in range(NUM_SELFPLAY_THREADS):
+		(X,Y,Z) = subDataQueue.get()
+		Xs.append(X)
+		Ys.append(Y)
+		Zs.append(Z)
 	
-	# print(Fore.BLUE + "Training epoch " + str(e) + " completed. Training loss: " + str(float(totalTrainLoss)) )
+	X = torch.concat(Xs)
+	Y = torch.concat(Ys)
+	Z = torch.concat(Zs)
 
-# torch.save(model.state_dict(), "data/test.pth")
-# torch.save(opt.state_dict(), "data/testopt.pth")
+	dataQueue.put((X,Y,Z))
+
+	end = time.time()
+
+	print(Fore.RED + "Self-play epoch ended. " + str(end-start) + " second elapsed.")
+
+if __name__ == "__main__":
+	
+	mp.set_start_method('spawn')
+
+	GenerationDataQueue = multiprocessing.Queue(2)
+
+	# Preloading self play data
+	filenames = [int(filename[:-3]) for filename in os.listdir("SelfPlayData")]
+	filenames.sort()
+
+	for i in range(min(len(filenames), EPOCHS_TRAINED)):
+		(X,Y,Z) = torch.load("SelfPlayData/" + str( filenames[len(filenames) - 1 - i] ) + ".pt" )
+		EPOCH_XS.append(X)
+		EPOCH_YS.append(Y)
+		EPOCH_ZS.append(Z)
+
+	if len(EPOCH_XS) >= MIN_EPOCHS_BEFORE_TRAINING:
+		x_data = torch.concat(EPOCH_XS[-EPOCHS_TRAINED:],dim=0)
+		y_data = torch.concat(EPOCH_YS[-EPOCHS_TRAINED:],dim=0)
+		z_data = torch.concat(EPOCH_ZS[-EPOCHS_TRAINED:],dim=0)
+		dataset = TensorDataset(x_data,y_data,z_data)
+
+		TRAINING_DATALOADER = DataLoader(dataset, shuffle=True, batch_size=BATCH_SIZE)
 
 
-# DATA GENERATION
-# Xs = []
-# Ys = []
-# Zs = []
+	while True:
+		
+		if TRAINING_DATALOADER != None:
+			CURRENT_MODEL.train()
 
-# for i in range(500):
-# 	game = Connect4(np.zeros((6,7)),1)
+			totalTrainLoss = 0
 
-# 	while True:
-# 		terminated = False
-# 		children = game.children()
-# 		for i in range(len(children)):
-# 			child = children[i]
-# 			if child != None and child.is_terminal():
-# 				Y = [0] * len(children)
-# 				Y[i] = 1
-# 				Z = game.player()
-# 				Xs.append(game.tensor_representation())
-# 				Ys.append(torch.tensor(Y).float())
-# 				Zs.append(Z)
-# 				terminated = True
+			for (x, y, z) in TRAINING_DATALOADER:
+				(x, y, z) = (x.float().to(DEVICE), y.float().to(DEVICE), z.float().to(DEVICE))
+
+				(policy_pred, value_pred) = CURRENT_MODEL(x)
+
+				loss = cross(policy_pred, y) + mse(value_pred, z)
+
+				OPT.zero_grad()
+				loss.backward()
+				OPT.step()
+
+				totalTrainLoss += loss
 			
-# 		if terminated:
-# 			break
+			print(Fore.BLUE + "Training epoch completed. Average loss: " + str(float(totalTrainLoss) * BATCH_SIZE / len(TRAINING_DATALOADER.dataset)) )
 
-# 		children = [ child for child in children if child != None ]
-# 		rand_i = random.randint(0,len(children)-1)
-# 		game = children[rand_i]
+		# time.sleep(.1)
 
-# X = torch.stack(Xs)
-# Y = torch.stack(Ys)
-# Z = torch.tensor(Zs)
+		if GENERATION_PROCESS == None or not GENERATION_PROCESS.is_alive():
+			
+			if GENERATION_PROCESS != None:
+				(X,Y,Z) = GenerationDataQueue.get()
+				EPOCH_XS.append(X)
+				EPOCH_YS.append(Y)
+				EPOCH_ZS.append(Z)
+				curr_time = str(int(time.time()))
+				torch.save((X,Y,Z),"SelfPlayData/" + curr_time + ".pt") # save self play data
 
-# torch.save(X, "data/Xs.pt")
-# torch.save(Y, "data/Ys.pt")
-# torch.save(Z, "data/Zs.pt")
+				if len(EPOCH_XS) >= MIN_EPOCHS_BEFORE_TRAINING:
+					x_data = torch.concat(EPOCH_XS[-EPOCHS_TRAINED:],dim=0)
+					y_data = torch.concat(EPOCH_YS[-EPOCHS_TRAINED:],dim=0)
+					z_data = torch.concat(EPOCH_ZS[-EPOCHS_TRAINED:],dim=0)
+					dataset = TensorDataset(x_data,y_data,z_data)
 
+					TRAINING_DATALOADER = DataLoader(dataset, shuffle=True, batch_size=BATCH_SIZE)
 
-
+			GENERATION_PROCESS = mp.Process(target=MP_SELFPLAY, args=(BEST_MODEL, GenerationDataQueue))
+			GENERATION_PROCESS.start()

@@ -507,8 +507,6 @@ def selfplay_PROCESS(m1, xq, yq):
 	xq.put(X)
 	yq.put(Y)
 
-	# print(Fore.MAGENTA + "Self-play process ended.")
-
 def MP_SELFPLAY(model):
 
 	Xq = multiprocessing.Queue(NUM_SELFPLAY_THREADS)
