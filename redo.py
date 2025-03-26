@@ -447,8 +447,8 @@ class MCTSOneSidedBatchComparator:
 
 # Something's wrong with this... It doesn't follow a binomial distribution so the trials are probably not independent		
 def MCTSCompare(batch_size, model1: Connect4NN, model2: Connect4NN, evaluations_per):
-	m1 = MCTSOneSidedBatchComparator(batch_size,model1,model2,evaluations_per//2)
-	m2 = MCTSOneSidedBatchComparator(batch_size,model2,model1,evaluations_per//2)
+	m1 = MCTSOneSidedBatchComparator(batch_size // 2,model1,model2,evaluations_per)
+	m2 = MCTSOneSidedBatchComparator(batch_size // 2,model2,model1,evaluations_per)
 
 	a = m1.run()
 	b = m2.run()
@@ -459,17 +459,17 @@ EPOCH_XS = []
 EPOCH_YS = []
 EPOCH_ZS = []
 
-TRAINING_EPOCHS = 32
 NUM_SELFPLAY_THREADS = 4
 NUM_GAMES_PER_SELFPLAY_THREAD = 64
-NUM_ITERATIONS_PER_MCTS = 50
+NUM_ITERATIONS_PER_MCTS = 100
 
 EVALUATION_NUM_GAMES = 64
+EVALUATION_ITERATIONS_PER = 50
 
 BATCH_SIZE = 256
-INIT_LR = 1e-3
+INIT_LR = 1e-4
 
-EPOCHS_TRAINED = 16
+EPOCHS_TRAINED = 24
 MIN_EPOCHS_BEFORE_TRAINING = 4
 
 BEST_MODEL = Connect4NN()
@@ -485,6 +485,7 @@ cross = nn.CrossEntropyLoss()
 mse = nn.MSELoss()
 
 GENERATION_PROCESS = None
+EVALUATION_PROCESS = None
 
 TRAINING_DATALOADER = None
 
@@ -536,11 +537,37 @@ def MP_SELFPLAY(model, dataQueue):
 
 	print(Fore.RED + "Self-play epoch ended. " + str(end-start) + " second elapsed.")
 
+def EVALUATION_THREAD(newcomer_statedict, defender_statedict, winnerQueue):
+
+	newcomer = Connect4NN()
+	defender = Connect4NN()
+
+	newcomer.load_state_dict(newcomer_statedict)
+	defender.load_state_dict(defender_statedict)
+
+	print(Fore.WHITE + Back.GREEN + "EVALUATION THREAD BEGIN." + Back.RESET)
+	newcomer.to(DEVICE)
+	defender.to(DEVICE)
+
+	num = MCTSCompare(EVALUATION_NUM_GAMES, newcomer, defender, EVALUATION_ITERATIONS_PER)
+
+	win_percent = (num + EVALUATION_NUM_GAMES) / 2 / EVALUATION_NUM_GAMES
+
+	if win_percent > .55:
+		newcomer.cpu()
+		winnerQueue.put(newcomer.state_dict())
+		print(Fore.WHITE + Back.GREEN + "NEW MODEL BEAT OUT OLD MODEL. WIN PERCENT: " + str(win_percent) + Back.RESET)
+	else:
+		defender.cpu()
+		winnerQueue.put(defender.state_dict())
+		print(Fore.WHITE + Back.GREEN + "Old model beat out new model. No change. WIN PERCENT: " + str(win_percent) + Back.RESET)
+
 if __name__ == "__main__":
 	
 	mp.set_start_method('spawn')
 
 	GenerationDataQueue = multiprocessing.Queue(2)
+	EvaluationStateDictQueue = multiprocessing.Queue(2)
 
 	# Preloading self play data
 	filenames = [int(filename[:-3]) for filename in os.listdir("SelfPlayData")]
@@ -559,7 +586,6 @@ if __name__ == "__main__":
 		dataset = TensorDataset(x_data,y_data,z_data)
 
 		TRAINING_DATALOADER = DataLoader(dataset, shuffle=True, batch_size=BATCH_SIZE)
-
 
 	while True:
 		
@@ -583,8 +609,6 @@ if __name__ == "__main__":
 			
 			print(Fore.BLUE + "Training epoch completed. Average loss: " + str(float(totalTrainLoss) * BATCH_SIZE / len(TRAINING_DATALOADER.dataset)) )
 
-		# time.sleep(.1)
-
 		if GENERATION_PROCESS == None or not GENERATION_PROCESS.is_alive():
 			
 			if GENERATION_PROCESS != None:
@@ -605,3 +629,19 @@ if __name__ == "__main__":
 
 			GENERATION_PROCESS = mp.Process(target=MP_SELFPLAY, args=(BEST_MODEL, GenerationDataQueue))
 			GENERATION_PROCESS.start()
+
+		if EVALUATION_PROCESS == None or not EVALUATION_PROCESS.is_alive():
+
+			if EVALUATION_PROCESS != None:
+				state_dict = EvaluationStateDictQueue.get()
+				BEST_MODEL.load_state_dict(state_dict)
+				# Save and load
+				print(Fore.GREEN + "Saving best model.")
+				torch.save(BEST_MODEL.state_dict(), "models/best_model.pth")
+				torch.save(OPT.state_dict(), "models/optimizer.pth")
+			
+			CURRENT_MODEL.cpu()
+			EVALUATION_PROCESS = mp.Process(target=EVALUATION_THREAD, args=(CURRENT_MODEL.state_dict(), BEST_MODEL.state_dict(), EvaluationStateDictQueue))
+			EVALUATION_PROCESS.start()
+
+			CURRENT_MODEL.to(DEVICE)
