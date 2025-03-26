@@ -4,7 +4,7 @@ from torch.utils.data import DataLoader, TensorDataset, Dataset, random_split
 from torchvision import datasets, transforms
 from torchvision.transforms import ToTensor
 from torch.optim import Adam
-from redo import Connect4NN, Connect4, MCTSNode, MCTSBatchSelfPlayer, DEVICE
+from c4 import Connect4NN, Connect4, MCTSNode, MCTSBatchSelfPlayer, DEVICE
 import numpy as np
 
 device = torch.accelerator.current_accelerator().type if torch.accelerator.is_available() else "cpu"
@@ -45,7 +45,7 @@ class SinglePlayer:
 		self.root = self.root._children[i]
 
 	def __str__(self):
-		return self.root._game.__str__() + "|0|1|2|3|4|5|6|\n"
+		return str(self.root) + self.root._game.__str__() + "|0|1|2|3|4|5|6|\n"
 
 	def is_terminal(self):
 		return self.root.is_terminal()
@@ -60,6 +60,7 @@ while not m.is_terminal():
 
 	i = int(input("Make your move! [0-6]:"))
 
+	# m.automove()
 	m.move(i)
 
 	print(m)
