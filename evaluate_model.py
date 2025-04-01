@@ -53,15 +53,14 @@ class SinglePlayer:
 m = SinglePlayer(model)
 
 while not m.is_terminal():
+
 	print(m)
 
 	for i in range(100):
 		m.iterate()
 
-	i = int(input("Make your move! [0-6]:"))
-
-	# m.automove()
-	m.move(i)
+	print("Automoving.")
+	m.automove()
 
 	print(m)
 
@@ -71,8 +70,11 @@ while not m.is_terminal():
 	for i in range(100):
 		m.iterate()
 
-	print("Automoving.")
-	m.automove()
+	i = int(input("Make your move! [0-6]:"))
+
+	# m.automove()
+	m.move(i)
+
 
 print(m)
 # current = MCTSNode(None, Connect4(np.zeros((6,7)),1))
